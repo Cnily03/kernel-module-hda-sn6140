@@ -1,0 +1,27 @@
+# Downloaded upstream packages and source archives
+/cache/
+
+# Temporary extracted source/header trees
+/.work/
+
+# Locally built kernel modules and metadata
+/dist/
+
+# Kbuild outputs if somebody invokes make directly in a source directory
+*.ko
+*.ko.*
+*.o
+*.mod
+*.mod.c
+*.order
+*.symvers
+.*.cmd
+
+# Read-only diagnostic reports (reports/.gitkeep remains tracked)
+/reports/report.sn6140.*.txt
+
+# Editor and shell noise
+*~
+*.swp
+.idea/
+.vscode/

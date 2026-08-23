@@ -1,0 +1,149 @@
+name: Build Module
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - synchronize
+      - ready_for_review
+  workflow_dispatch:
+    inputs:
+      kernel_package_version:
+        description: Arch linux-zen package version
+        required: false
+        type: string
+      kernel_release:
+        description: Exact kernel release from the matching headers package
+        required: false
+        type: string
+      codec_subsystem_id:
+        description: Eight-hex-digit SN6140 codec subsystem ID
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-module-sn6140-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build snd-hda-codec-conexant.ko
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve and validate target
+        env:
+          INPUT_PACKAGE_VERSION: ${{ inputs.kernel_package_version }}
+          INPUT_KERNEL_RELEASE: ${{ inputs.kernel_release }}
+          INPUT_CODEC_SUBSYSTEM_ID: ${{ inputs.codec_subsystem_id }}
+        run: |
+          set -euo pipefail
+          source .github/targets.env
+
+          input_count=0
+          [[ -z "$INPUT_PACKAGE_VERSION" ]] || ((input_count += 1))
+          [[ -z "$INPUT_KERNEL_RELEASE" ]] || ((input_count += 1))
+          [[ -z "$INPUT_CODEC_SUBSYSTEM_ID" ]] || ((input_count += 1))
+          if ((input_count != 0 && input_count != 3)); then
+            echo 'Manual target override requires all three inputs' >&2
+            exit 1
+          fi
+          if ((input_count == 3)); then
+            TARGET_PACKAGE_VERSION=$INPUT_PACKAGE_VERSION
+            TARGET_KERNEL_RELEASE=$INPUT_KERNEL_RELEASE
+            TARGET_CODEC_SUBSYSTEM_ID=${INPUT_CODEC_SUBSYSTEM_ID,,}
+          fi
+
+          [[ $TARGET_PACKAGE_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+\.zen[0-9]+-[0-9]+$ ]]
+          [[ $TARGET_KERNEL_RELEASE =~ ^[A-Za-z0-9._+-]+$ ]]
+          [[ $TARGET_CODEC_SUBSYSTEM_ID =~ ^0x[0-9a-f]{8}$ ]]
+
+          printf 'TARGET_PACKAGE_VERSION=%s\n' "$TARGET_PACKAGE_VERSION" >> "$GITHUB_ENV"
+          printf 'TARGET_KERNEL_RELEASE=%s\n' "$TARGET_KERNEL_RELEASE" >> "$GITHUB_ENV"
+          printf 'TARGET_CODEC_SUBSYSTEM_ID=%s\n' "$TARGET_CODEC_SUBSYSTEM_ID" >> "$GITHUB_ENV"
+
+      - name: Restore verified source cache
+        uses: actions/cache@v6
+        with:
+          path: cache
+          key: sn6140-linux-zen-${{ env.TARGET_PACKAGE_VERSION }}-${{ hashFiles('patches/*.patch', 'scripts/build.sh') }}
+
+      - name: Install Arch build tools
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed \
+            archlinux-keyring \
+            curl \
+            gnupg \
+            kmod \
+            libarchive \
+            patch \
+            zstd
+
+          # The builder intentionally rejects root.  Its downloads, temporary
+          # GPG keyring, source trees, and output should all be unprivileged.
+          useradd --create-home --shell /bin/bash sn6140-build
+          chown -R sn6140-build:sn6140-build "$GITHUB_WORKSPACE"
+
+      - name: Syntax checks
+        run: runuser -u sn6140-build -- make check
+
+      - name: Build exact target module
+        run: |
+          runuser -u sn6140-build -- \
+            ./scripts/build.sh \
+              --target-package-version "$TARGET_PACKAGE_VERSION" \
+              --target-kernel-release "$TARGET_KERNEL_RELEASE" \
+              --codec-subsystem-id "$TARGET_CODEC_SUBSYSTEM_ID" \
+              --assume-sn6140-topology
+
+      - name: Validate and checksum artifacts
+        run: |
+          set -euo pipefail
+          artifact_dir="dist/$TARGET_KERNEL_RELEASE"
+          module="$artifact_dir/snd-hda-codec-conexant.ko"
+          compressed="$module.zst"
+
+          test -s "$module"
+          test -s "$compressed"
+          test "$(modinfo -F name "$module")" = snd_hda_codec_conexant
+          [[ $(modinfo -F vermagic "$module") == "$TARGET_KERNEL_RELEASE "* ]]
+          zstd -t "$compressed"
+
+          (
+            cd "$artifact_dir"
+            sha256sum \
+              snd-hda-codec-conexant.ko \
+              snd-hda-codec-conexant.ko.zst \
+              BUILD-INFO.txt > SHA256SUMS
+          )
+
+      - name: Upload kernel module
+        uses: actions/upload-artifact@v7
+        with:
+          name: sn6140-conexant-${{ env.TARGET_KERNEL_RELEASE }}
+          path: |
+            dist/${{ env.TARGET_KERNEL_RELEASE }}/snd-hda-codec-conexant.ko
+            dist/${{ env.TARGET_KERNEL_RELEASE }}/snd-hda-codec-conexant.ko.zst
+            dist/${{ env.TARGET_KERNEL_RELEASE }}/BUILD-INFO.txt
+            dist/${{ env.TARGET_KERNEL_RELEASE }}/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
