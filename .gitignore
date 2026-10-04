@@ -17,11 +17,14 @@
 *.symvers
 .*.cmd
 
-# Read-only diagnostic reports (reports/.gitkeep remains tracked)
-/reports/report.sn6140.*.txt
+# Local diagnostic reports and validation records
+/reports/
 
 # Editor and shell noise
 *~
 *.swp
 .idea/
 .vscode/
+
+# Python regression tests
+__pycache__/

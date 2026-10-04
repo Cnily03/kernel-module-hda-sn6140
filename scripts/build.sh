@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Build only snd-hda-codec-conexant.ko for the currently running Arch
+# Build only snd-hda-codec-conexant.ko for a running or DKMS-targeted Arch
 # linux-zen kernel.  Nothing is installed into /usr/lib/modules.
 
 set -euo pipefail
@@ -18,6 +18,7 @@ target_kernel_release=''
 target_codec_ssid=''
 assume_topology=0
 explicit_target=0
+dkms_kernel=''
 
 # Keep CLI handling deliberately small: the builder has no install or load
 # switch, so running it as a normal user cannot mutate the active kernel.
@@ -32,6 +33,8 @@ sources.  It never installs or loads a module.
 Options:
   --cache DIR       Download cache (default: PROJECT/cache)
   --output DIR      Artifact base directory (default: PROJECT/dist)
+  --dkms-kernel RELEASE
+                    Internal DKMS mode: use installed target headers, not uname
   --offline         Do not download; fail if any cache file is missing
   --keep-work       Keep the temporary build directory for inspection
   --target-package-version VERSION
@@ -45,8 +48,8 @@ Options:
   -h, --help        Show this help
 
 The three explicit target values and --assume-sn6140-topology must be supplied
-together.  Without them, the script always discovers and validates live local
-hardware and the currently running kernel.
+together. Without them or --dkms-kernel, the script validates live hardware
+and the running kernel. DKMS validates hardware separately before installation.
 EOF
 }
 
@@ -73,6 +76,11 @@ while (($#)); do
     --output)
       (($# >= 2)) || die '--output requires a directory'
       output_base=$2
+      shift 2
+      ;;
+    --dkms-kernel)
+      (($# >= 2)) || die '--dkms-kernel requires a release'
+      dkms_kernel=$2
       shift 2
       ;;
     --offline)
@@ -128,19 +136,35 @@ if ((explicit_value_count > 0 || assume_topology)); then
   explicit_target=1
 fi
 
-for cmd in awk bsdtar cat cp curl gcc gpg grep head install make mktemp modinfo mv \
+if [[ -n $dkms_kernel ]]; then
+  [[ $dkms_kernel =~ ^[0-9][A-Za-z0-9._+-]*-zen$ ]] || die 'Invalid DKMS linux-zen release'
+  ((explicit_target == 0)) || die 'DKMS and explicit CI modes are mutually exclusive'
+fi
+
+for cmd in awk bsdtar cat cp curl gcc gpg gpgv grep head install make mktemp modinfo mv \
   pacman pacman-key patch sed sha256sum uname xz zgrep zstd; do
   need "$cmd"
 done
 
-((EUID != 0)) || die 'Run this builder as a normal user, not root'
+[[ -n $dkms_kernel ]] || ((EUID != 0)) || die 'Run this builder as a normal user, not root'
 [[ -r $patch_file ]] || die "Patch not found: $patch_file"
 
 # Explicit mode exists for hardware-less CI runners.  Normal local operation
 # still derives every value from the live system and validates the codec pins.
 kernel_package=linux-zen
 codec_vendor=0x14f11f87
-if ((explicit_target)); then
+if [[ -n $dkms_kernel ]]; then
+  # DKMS runs before reboot: never use uname -r or /proc/config.gz here.
+  source "$project_dir/scripts/lib/detect.sh"
+  kernel_release=$dkms_kernel
+  detect_target "$kernel_release"
+  package_version=$detected_package_version
+  build_tree=$detected_build_tree
+  selected_module_path='dkms-target'
+  package_module_path='dkms-managed-original'
+  codec_ssid=0x19e5327e
+  codec_dump='fixed-supported-quirk:hardware-checked-before-install'
+elif ((explicit_target)); then
   kernel_release=$target_kernel_release
   package_version=$target_package_version
   codec_ssid=$target_codec_ssid
@@ -199,36 +223,12 @@ else
       die "Kernel lockdown is active: $lockdown_state"
   fi
 
-  # A generic "all SN6140" quirk would be unsafe because GPIO/EAPD wiring is
-  # board-specific even when the codec vendor ID is identical.
-  mapfile -t sn6140_codecs < <(grep -l -x 'Codec: Conexant SN6140' /proc/asound/card*/codec#* 2>/dev/null || true)
-  [[ ${#sn6140_codecs[@]} -eq 1 ]] || \
-    die "Expected exactly one Conexant SN6140 codec dump; found ${#sn6140_codecs[@]}"
-  codec_dump=${sn6140_codecs[0]}
-  codec_vendor=$(awk '/^Vendor Id:/ { print tolower($3); exit }' "$codec_dump")
-  codec_ssid=$(awk '/^Subsystem Id:/ { print tolower($3); exit }' "$codec_dump")
-  [[ $codec_vendor =~ ^0x[0-9a-f]{8}$ ]] || die "Invalid codec vendor ID: $codec_vendor"
-  [[ $codec_ssid =~ ^0x[0-9a-f]{8}$ ]] || die "Invalid codec subsystem ID: $codec_ssid"
-  [[ $codec_vendor == 0x14f11f87 ]] || die "Unexpected SN6140 vendor ID: $codec_vendor"
+  source "$project_dir/scripts/lib/detect.sh"
+  detect_hardware
 
-  node_block() {
-    local nid=$1
-    awk -v wanted="$nid" '
-      $1 == "Node" && $2 == wanted { active = 1 }
-      active && $1 == "Node" && $2 != wanted { exit }
-      active { print }
-    ' "$codec_dump"
-  }
-
-  node16=$(node_block 0x16)
-  node17=$(node_block 0x17)
-  grep -Fq '[Jack] HP Out' <<<"$node16" || die 'NID 0x16 is not the expected headphone pin'
-  grep -Fq 'Connection: 2' <<<"$node16" || die 'NID 0x16 does not expose the expected two-way selector'
-  grep -Fq '[Fixed] Speaker' <<<"$node17" || die 'NID 0x17 is not the expected fixed speaker pin'
-  grep -Fq 'Connection: 2' <<<"$node17" || die 'NID 0x17 does not expose the expected two-way selector'
-  grep -Eq '^GPIO: io=[1-9]' "$codec_dump" || die 'Codec does not expose GPIO controls'
-  grep -Fq 'IO[1]: enable=1, dir=1' "$codec_dump" || die 'GPIO1 is not enabled as an output'
 fi
+
+[[ $codec_ssid == 0x19e5327e ]] || die 'Unsupported codec subsystem ID; a different board needs its own quirk'
 
 arch=$(uname -m)
 [[ $arch == x86_64 ]] || die "Only x86_64 is supported; found $arch"
@@ -275,7 +275,7 @@ download() {
   ((offline == 0)) || die "Offline cache miss: $destination"
   note "Downloading $(basename -- "$destination")"
   curl --fail --location --proto '=https' --tlsv1.2 \
-    --retry 3 --output "$destination.part" "$url"
+    --connect-timeout 20 --max-time 1800 --retry 3 --output "$destination.part" "$url"
   mv -- "$destination.part" "$destination"
 }
 
@@ -285,57 +285,67 @@ archive_base='https://archive.archlinux.org/packages/l/linux-zen-headers'
 kernel_base="https://cdn.kernel.org/pub/linux/kernel/v${linux_version%%.*}.x"
 zen_base="https://github.com/zen-kernel/zen-kernel/releases/download/v${linux_version}-${zen_revision}"
 
-download "$archive_base/$headers_archive" "$cache_dir/$headers_archive"
-download "$archive_base/$headers_archive.sig" "$cache_dir/$headers_archive.sig"
+if [[ -z $dkms_kernel ]]; then
+  download "$archive_base/$headers_archive" "$cache_dir/$headers_archive"
+  download "$archive_base/$headers_archive.sig" "$cache_dir/$headers_archive.sig"
+fi
 download "$kernel_base/$linux_archive" "$cache_dir/$linux_archive"
 download "$kernel_base/$linux_signature" "$cache_dir/$linux_signature"
 download "$zen_base/$zen_archive" "$cache_dir/$zen_archive"
 download "$zen_base/$zen_archive.sig" "$cache_dir/$zen_archive.sig"
 
-note 'Verifying the archived Arch headers package'
-pacman-key --verify "$cache_dir/$headers_archive.sig" "$cache_dir/$headers_archive"
+if [[ -z $dkms_kernel ]]; then
+  note 'Verifying the archived Arch headers package'
+  pacman-key --verify "$cache_dir/$headers_archive.sig" "$cache_dir/$headers_archive"
+fi
 
 # A private temporary keyring avoids adding build-only keys to ~/.gnupg.  The
-# exported public-key bundle makes later --offline builds genuinely offline.
+# cached public-key bundle makes later --offline builds genuinely offline.
 gpg_home="$work_dir/gnupg"
 mkdir -m 700 -- "$gpg_home"
 key_bundle="$cache_dir/linux-zen-source-signing-keys.gpg"
-if [[ -s $key_bundle ]]; then
-  note 'Importing cached source-signing keys into the temporary keyring'
-  GNUPGHOME="$gpg_home" gpg --batch --no-autostart --import "$key_bundle"
-else
+if [[ ! -s $key_bundle ]]; then
   ((offline == 0)) || die "Offline signing-key cache miss: $key_bundle"
-  note 'Importing source-signing keys into the temporary keyring'
-  GNUPGHOME="$gpg_home" gpg --batch --keyserver hkps://keyserver.ubuntu.com \
-    --recv-keys \
-    647F28654894E3BD457199BE38DBBDC86092693E \
-    83BC8889351B5DEBBB68416EB8AC08600F108CDF
-  GNUPGHOME="$gpg_home" gpg --batch --export \
-    647F28654894E3BD457199BE38DBBDC86092693E \
-    83BC8889351B5DEBBB68416EB8AC08600F108CDF > "$key_bundle"
+  note 'Fetching pinned source-signing public keys'
+  for fingerprint in 647F28654894E3BD457199BE38DBBDC86092693E 83BC8889351B5DEBBB68416EB8AC08600F108CDF; do
+    curl --fail --location --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 120 --retry 3 \
+      "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x$fingerprint" \
+      -o "$work_dir/$fingerprint.asc"
+    cat "$work_dir/$fingerprint.asc" >> "$work_dir/signing-keys.asc"
+  done
+  # A public-key ring needs no gpg-agent, dirmngr, trustdb or private key.
+  GNUPGHOME="$gpg_home" gpg --no-options --batch --dearmor < "$work_dir/signing-keys.asc" > "$key_bundle.part"
+  mv -- "$key_bundle.part" "$key_bundle"
 fi
 
 note 'Verifying Linux and Zen source signatures'
 xz -dc "$cache_dir/$linux_archive" > "$work_dir/linux-${linux_version}.tar"
-GNUPGHOME="$gpg_home" gpg --batch --no-autostart --verify \
-  "$cache_dir/$linux_signature" "$work_dir/linux-${linux_version}.tar"
-GNUPGHOME="$gpg_home" gpg --batch --no-autostart --verify \
-  "$cache_dir/$zen_archive.sig" "$cache_dir/$zen_archive"
+verify_source() {
+  local signature=$1 data=$2 fingerprint=$3
+  gpgv --homedir "$gpg_home" --keyring "$key_bundle" --status-fd 1 "$signature" "$data" > "$work_dir/signature-status"
+  # Accept the pinned primary key or one of its signing subkeys only.
+  awk -v wanted="$fingerprint" '$2 == "VALIDSIG" && ($3 == wanted || $NF == wanted) { valid = 1 } END { exit !valid }' \
+    "$work_dir/signature-status" || die "Unexpected signer for $signature"
+}
+verify_source "$cache_dir/$linux_signature" "$work_dir/linux-${linux_version}.tar" 647F28654894E3BD457199BE38DBBDC86092693E
+verify_source "$cache_dir/$zen_archive.sig" "$cache_dir/$zen_archive" 83BC8889351B5DEBBB68416EB8AC08600F108CDF
 
 headers_root="$work_dir/headers-root"
 source_root="$work_dir/source-root"
 mkdir -p -- "$headers_root" "$source_root"
 note 'Extracting exact headers and sources'
-bsdtar -xf "$cache_dir/$headers_archive" -C "$headers_root"
+if [[ -z $dkms_kernel ]]; then
+  bsdtar -xf "$cache_dir/$headers_archive" -C "$headers_root"
+  build_tree="$headers_root/usr/lib/modules/$kernel_release/build"
+fi
 bsdtar -xf "$work_dir/linux-${linux_version}.tar" -C "$source_root"
 
-build_tree="$headers_root/usr/lib/modules/$kernel_release/build"
 source_tree="$source_root/linux-$linux_version"
 [[ -d $build_tree ]] || die "Headers package does not contain build tree for $kernel_release"
 [[ -s $build_tree/Module.symvers ]] || die 'Exact headers tree has no Module.symvers'
 [[ -r $source_tree/sound/hda/codecs/conexant.c ]] || die 'Conexant source is missing'
 grep -Fq "\"$kernel_release\"" "$build_tree/include/generated/utsrelease.h" || \
-  die 'Extracted headers release does not match uname -r'
+  die 'Headers release does not match the build target'
 grep -Fq 'CONFIG_SND_HDA_CODEC_CONEXANT=m' "$build_tree/.config" || \
   die 'Target kernel config does not build the Conexant codec as a module'
 
@@ -356,13 +366,13 @@ patch --batch --forward --fuzz=0 -d "$source_tree" -Np1 < "$work_dir/zen.patch"
 note 'Applying the SN6140 routing patch'
 patch --batch --forward --fuzz=0 -d "$source_tree" -Np1 < "$patch_file"
 
-# Replace the original PCI-controller SSID match with a codec-SSID match derived
-# from the live codec.  This keeps the quirk safe without tying it to 19e5:3e5f.
+# Replace the RFC PCI-controller match with the known supported codec SSID.
+# Live detection verifies this ID; DKMS never invents a new hardware quirk.
 codec_subvendor=${codec_ssid:2:4}
 codec_subdevice=${codec_ssid:6:4}
 conexant_source="$source_tree/sound/hda/codecs/conexant.c"
 old_quirk='SND_PCI_QUIRK(0x19e5, 0x3e5f, "Huawei MateBook 16s CREF-XX", CXT_FIXUP_HUAWEI_CREF),'
-new_quirk="HDA_CODEC_QUIRK(0x${codec_subvendor}, 0x${codec_subdevice}, \"Huawei SN6140 detected codec SSID\", CXT_FIXUP_HUAWEI_CREF),"
+new_quirk="HDA_CODEC_QUIRK(0x${codec_subvendor}, 0x${codec_subdevice}, \"Huawei SN6140 supported codec SSID\", CXT_FIXUP_HUAWEI_CREF),"
 grep -Fq "$old_quirk" "$conexant_source" || die 'Could not locate the newly added PCI quirk'
 awk -v old="$old_quirk" -v new="$new_quirk" '
   {
@@ -388,24 +398,25 @@ cp -- "$source_tree/sound/hda/codecs/generic.h" "$module_source/generic.h"
 cp -- "$source_tree/sound/hda/common/"*.h "$module_source/common/"
 cp -R -- "$source_tree/sound/hda/codecs/helpers" "$module_source/helpers"
 
-# Module BTF is optional for loading.  Hide the extracted vmlinux when pahole is
-# unavailable so Kbuild skips BTF instead of requiring extra host packages.
+# Never mutate the installed DKMS headers. BTF is optional; disable only the
+# external module's BTF pass when pahole is unavailable.
 btf_state='included'
+make_options=()
 if ! command -v pahole >/dev/null 2>&1 && [[ -f $build_tree/vmlinux ]]; then
-  mv -- "$build_tree/vmlinux" "$work_dir/vmlinux-for-reference"
+  make_options+=(CONFIG_DEBUG_INFO_BTF_MODULES=)
   btf_state='skipped (pahole unavailable)'
 fi
 
 note "Building only snd-hda-codec-conexant.ko for $kernel_release"
-make -C "$build_tree" M="$module_source" modules
+make -C "$build_tree" M="$module_source" "${make_options[@]}" modules
 module_ko="$module_source/snd-hda-codec-conexant.ko"
 [[ -s $module_ko ]] || die 'Kbuild did not produce snd-hda-codec-conexant.ko'
 
 built_vermagic=$(modinfo -F vermagic "$module_ko")
-if ((explicit_target)); then
+if ((explicit_target)) || [[ -n $dkms_kernel ]]; then
   [[ $built_vermagic == "$kernel_release "* ]] || \
     die "vermagic release mismatch: built '$built_vermagic', target '$kernel_release'"
-  reference_vermagic='not-available-in-explicit-ci-mode'
+  reference_vermagic='target-release-checked'
 else
   reference_vermagic=$(modinfo -F vermagic snd_hda_codec_conexant)
   [[ $built_vermagic == "$reference_vermagic" ]] || \
@@ -429,7 +440,7 @@ selected_module=$selected_module_path
 distribution_module=$package_module_path
 reference_vermagic=$reference_vermagic
 built_vermagic=$built_vermagic
-build_mode=$([[ $explicit_target -eq 1 ]] && echo explicit-ci || echo live-auto-detect)
+build_mode=$([[ -n $dkms_kernel ]] && echo dkms-target || { [[ $explicit_target -eq 1 ]] && echo explicit-ci || echo live-auto-detect; })
 codec_dump=$codec_dump
 codec_vendor=$codec_vendor
 codec_subsystem_id=$codec_ssid

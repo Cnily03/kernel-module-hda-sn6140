@@ -95,6 +95,7 @@ jobs:
             kmod \
             libarchive \
             patch \
+            python \
             zstd
 
           # The builder intentionally rejects root.  Its downloads, temporary

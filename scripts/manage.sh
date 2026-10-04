@@ -99,6 +99,9 @@ case "$action" in
     ;;
   install)
     ((EUID == 0)) || die 'install requires root; invoke this explicit action with sudo'
+    if pacman -Qq sn6140-linux-zen-dkms >/dev/null 2>&1; then
+      die 'The DKMS package is installed; manage this module with pacman, not the legacy installer'
+    fi
     validate_artifact
     [[ ! -e $target ]] || die "Override already exists: $target"
     # updates/ has higher depmod priority than built-in module directories on
